@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub struct UserRow {
-    pub person: u128,
+    pub person: u64,
     pub day: i32,
     pub sessions: i64,
     pub events: i64,
@@ -255,7 +255,7 @@ fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>]) {
     let mut top = Vec::with_capacity(n * 8);
     let mut defs = Vec::with_capacity(n);
     for r in rows {
-        put_bytes(&mut ids, &crate::key_bytes(r.person));
+        put_bytes(&mut ids, &crate::ukey_bytes(r.person));
         days.extend_from_slice(&r.day.to_le_bytes());
         ses.extend_from_slice(&r.sessions.to_le_bytes());
         evs.extend_from_slice(&r.events.to_le_bytes());

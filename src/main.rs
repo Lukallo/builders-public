@@ -132,6 +132,55 @@ impl KeyMap {
     }
 }
 
+// ---------- open-addressing u64 -> u64 map (key 0 = empty) ----------
+pub struct KeyMap64 {
+    mask: usize,
+    slots: Vec<[u64; 2]>,
+}
+impl KeyMap64 {
+    pub fn new(n: usize) -> KeyMap64 {
+        let cap = (n * 3 / 2 + 16).next_power_of_two();
+        KeyMap64 { mask: cap - 1, slots: vec![[0, 0]; cap] }
+    }
+    #[inline]
+    fn idx(&self, k: u64) -> usize {
+        (mix(k as u128) as usize) & self.mask
+    }
+    pub fn insert(&mut self, k: u64, v: u64) {
+        let mut i = self.idx(k);
+        loop {
+            let s = &mut self.slots[i];
+            if s[0] == 0 || s[0] == k {
+                *s = [k, v];
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline]
+    pub fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch(self.slots.as_ptr().add(self.idx(k)) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[inline]
+    pub fn get_or_self(&self, k: u64) -> u64 {
+        let mut i = self.idx(k);
+        loop {
+            let s = self.slots[i];
+            if s[0] == k {
+                return s[1];
+            }
+            if s[0] == 0 {
+                return k;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 // ---------- string keys ----------
 // Strings up to 15 bytes are packed big-endian with the length in the low byte,
 // so u128 order equals byte-wise string order. Longer strings are interned and
@@ -194,6 +243,134 @@ pub fn key_bytes(k: u128) -> Vec<u8> {
 fn key_cmp(a: u128, b: u128) -> std::cmp::Ordering {
     if a & 0xFF == 0xFF || b & 0xFF == 0xFF {
         key_bytes(a).cmp(&key_bytes(b))
+    } else {
+        a.cmp(&b)
+    }
+}
+
+/// Exact 8-byte key for event IDs: up to 9 bytes in 1..=127 are packed 7 bits
+/// each (left-aligned, top bit 0); anything else is interned with the top bit set.
+static ELONG: Mutex<Option<HashMap<Vec<u8>, u64>>> = Mutex::new(None);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "bmi2"))]
+#[inline(always)]
+pub fn ekey(s: &[u8]) -> u64 {
+    use std::arch::x86_64::*;
+    let n = s.len();
+    if n <= 9 && n > 0 {
+        unsafe {
+            let v = _mm_maskz_loadu_epi8(((1u32 << n) - 1) as u16, s.as_ptr() as *const i8);
+            // every byte must be in 1..=127
+            let nz = _mm_test_epi8_mask(v, v) as u32;
+            let hi = _mm_movemask_epi8(v) as u32;
+            if nz == (1u32 << n) - 1 && hi == 0 {
+                let w: [u64; 2] = std::mem::transmute(v);
+                // 8 bytes x 7 bits = 56 bits, then the 9th byte on top: 63 bits
+                return _pext_u64(w[0], 0x7F7F_7F7F_7F7F_7F7F) | ((w[1] & 0x7F) << 56);
+            }
+        }
+    }
+    ekey_long(s)
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "bmi2")))]
+#[inline(always)]
+pub fn ekey(s: &[u8]) -> u64 {
+    let n = s.len();
+    if n <= 9 && n > 0 {
+        let mut v: u64 = 0;
+        let mut bad = 0u8;
+        for &b in s {
+            bad |= (b == 0 || b > 127) as u8;
+            v = (v << 7) | b as u64;
+        }
+        if bad == 0 {
+            return v << (7 * (9 - n));
+        }
+    }
+    ekey_long(s)
+}
+#[cold]
+fn ekey_long(s: &[u8]) -> u64 {
+    let mut g = ELONG.lock().unwrap();
+    let m = g.get_or_insert_with(HashMap::new);
+    let next = (1u64 << 63) | (m.len() as u64 + 1);
+    *m.entry(s.to_vec()).or_insert(next)
+}
+
+/// Order-preserving exact 8-byte key for user and click IDs: up to 9 bytes in
+/// 1..=127 are packed 7 bits each, left-aligned, so u64 order is byte order.
+/// Anything else is interned and gets the top bit set (compare those by bytes).
+static ULONG: Mutex<Option<(HashMap<Vec<u8>, u64>, Vec<Vec<u8>>)>> = Mutex::new(None);
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "bmi2"))]
+#[inline(always)]
+pub fn ukey(s: &[u8]) -> u64 {
+    use std::arch::x86_64::*;
+    let n = s.len();
+    if n <= 9 && n > 0 {
+        unsafe {
+            let v = _mm_maskz_loadu_epi8(((1u32 << n) - 1) as u16, s.as_ptr() as *const i8);
+            let nz = _mm_test_epi8_mask(v, v) as u32;
+            let hi = _mm_movemask_epi8(v) as u32;
+            if nz == (1u32 << n) - 1 && hi == 0 {
+                let w: [u64; 2] = std::mem::transmute(v);
+                return (_pext_u64(w[0].swap_bytes(), 0x7F7F_7F7F_7F7F_7F7F) << 7) | (w[1] & 0x7F);
+            }
+        }
+    }
+    ukey_long(s)
+}
+#[allow(dead_code)]
+#[inline(always)]
+pub fn ukey_scalar(s: &[u8]) -> u64 {
+    let n = s.len();
+    if n <= 9 && n > 0 {
+        let mut v: u64 = 0;
+        let mut bad = 0u8;
+        for i in 0..9 {
+            let b = if i < n { s[i] } else { 0 };
+            bad |= (i < n && (b == 0 || b > 127)) as u8;
+            v = (v << 7) | b as u64;
+        }
+        if bad == 0 {
+            return v;
+        }
+    }
+    ukey_long(s)
+}
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl", target_feature = "bmi2")))]
+#[inline(always)]
+pub fn ukey(s: &[u8]) -> u64 {
+    ukey_scalar(s)
+}
+#[cold]
+fn ukey_long(s: &[u8]) -> u64 {
+    let mut g = ULONG.lock().unwrap();
+    let (m, l) = g.get_or_insert_with(|| (HashMap::new(), Vec::new()));
+    if let Some(&k) = m.get(s) {
+        return k;
+    }
+    let k = (1u64 << 63) | l.len() as u64;
+    l.push(s.to_vec());
+    m.insert(s.to_vec(), k);
+    k
+}
+pub fn ukey_bytes(k: u64) -> Vec<u8> {
+    if k >> 63 == 1 {
+        return ULONG.lock().unwrap().as_ref().unwrap().1[(k & !(1u64 << 63)) as usize].clone();
+    }
+    let mut out = Vec::with_capacity(9);
+    for i in 0..9 {
+        let b = ((k >> (7 * (8 - i))) & 0x7F) as u8;
+        if b == 0 {
+            break;
+        }
+        out.push(b);
+    }
+    out
+}
+#[inline]
+pub fn ukey_cmp(a: u64, b: u64) -> std::cmp::Ordering {
+    if (a | b) >> 63 == 1 {
+        ukey_bytes(a).cmp(&ukey_bytes(b))
     } else {
         a.cmp(&b)
     }
@@ -514,30 +691,29 @@ impl<T: Copy> Parts<T> {
 #[derive(Clone, Copy)]
 #[repr(C, packed(4))]
 struct RawEv {
-    eid: u128,
-    person: u128,
+    eid: u64,
+    /// user key; 0 means the copy is invalid
+    person: u64,
     ingest: i64,
     ts: u32,
-    price: u32,
-    cat: u16,
-    valid: bool,
-    typ: u8,
+    /// 0 for view/cart; for a purchase (category << 24) | price
+    pc: u32,
 }
 #[derive(Clone, Copy)]
 #[repr(C, packed(4))]
 pub struct Ev {
-    pub person: u128,
+    pub person: u64,
     pub ts: u32,
-    pub price: u32,
-    pub cat: u16,
-    pub typ: u8,
+    /// 0 for view/cart; for a purchase (category << 24) | price (price < 2^24)
+    pub pc: u32,
 }
 #[derive(Clone, Copy)]
 #[repr(C, packed(4))]
 pub struct Ck {
-    pub person: u128,
-    pub ts: i64,
-    pub cid: u128,
+    pub person: u64,
+    /// ms since window_start - 7 days
+    pub ts: u32,
+    pub cid: u64,
     pub camp: u32,
 }
 
@@ -575,7 +751,7 @@ fn parse_manifest(d: &[u8]) -> (i64, i64) {
 }
 
 fn main() {
-    debug_assert!(std::mem::size_of::<RawEv>() == 52);
+    debug_assert!(std::mem::size_of::<RawEv>() == 32);
     let t0 = std::time::Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let data = PathBuf::from(
@@ -586,7 +762,7 @@ fn main() {
     );
     let (ws, we) = parse_manifest(&read_small(&data.join("manifest.json")));
     // event times are stored as u32 ms offsets from window_start (windows are 14 days)
-    assert!(we - ws < (1i64 << 32), "window longer than 49 days");
+    assert!(we - ws + WEEK < (1i64 << 32), "window longer than 42 days");
 
     // products / categories
     let mut cat_names: Vec<Vec<u8>> = vec![];
@@ -618,6 +794,8 @@ fn main() {
         cat_names.push(b"unknown".to_vec());
         (cat_names.len() - 1) as u16
     });
+    // purchases pack the category into 8 bits next to the price
+    assert!(cat_names.len() <= 255, "more than 255 categories");
     let mut order: Vec<usize> = (0..cat_names.len()).collect();
     order.sort_by(|&a, &b| cat_names[a].cmp(&cat_names[b]));
     let mut cat_rank = vec![0u16; cat_names.len()];
@@ -652,14 +830,14 @@ fn main() {
     });
     let ncamp = camp_ids.len();
 
-    let build_links = || -> KeyMap {
+    let build_links = || -> KeyMap64 {
     // ---------- links ----------
     let lsrc = Source::open(&data.join("links"), 4 << 20);
-    let pairs: Vec<Vec<(u128, u128)>> = lsrc.run(|d| {
+    let pairs: Vec<Vec<(u64, u64)>> = lsrc.run(|d| {
             let mut v = vec![];
             each_record::<2>(d, |[a, b]| {
                 if !a.is_empty() && !b.is_empty() {
-                    v.push((key(a), key(b)));
+                    v.push((ukey(a), ukey(b)));
                 }
             });
             v
@@ -667,7 +845,7 @@ fn main() {
     eprintln!("links parsed {:?}", t0.elapsed());
     let total_pairs: usize = pairs.iter().map(|v| v.len()).sum();
     let mut idx = KeyMap::new(total_pairs);
-    let mut keys: Vec<u128> = vec![];
+    let mut keys: Vec<u64> = vec![];
     let mut parent: Vec<u32> = vec![];
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
@@ -679,21 +857,21 @@ fn main() {
     }
     for v in &pairs {
         for &(a, b) in v {
-            let ia = match idx.get(a) {
+            let ia = match idx.get(a as u128) {
                 Some(v) => v as u32,
                 None => {
                     keys.push(a);
                     parent.push(keys.len() as u32 - 1);
-                    idx.insert(a, (keys.len() - 1) as u128);
+                    idx.insert(a as u128, (keys.len() - 1) as u128);
                     keys.len() as u32 - 1
                 }
             };
-            let ib = match idx.get(b) {
+            let ib = match idx.get(b as u128) {
                 Some(v) => v as u32,
                 None => {
                     keys.push(b);
                     parent.push(keys.len() as u32 - 1);
-                    idx.insert(b, (keys.len() - 1) as u128);
+                    idx.insert(b as u128, (keys.len() - 1) as u128);
                     keys.len() as u32 - 1
                 }
             };
@@ -706,14 +884,14 @@ fn main() {
     }
     let n = keys.len();
     eprintln!("links uf {:?}", t0.elapsed());
-    let mut minkey: Vec<u128> = keys.clone();
+    let mut minkey: Vec<u64> = keys.clone();
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
-        if key_cmp(keys[i], minkey[r]) == std::cmp::Ordering::Less {
+        if ukey_cmp(keys[i], minkey[r]) == std::cmp::Ordering::Less {
             minkey[r] = keys[i];
         }
     }
-    let mut person_of = KeyMap::new(n);
+    let mut person_of = KeyMap64::new(n);
     for i in 0..n {
         let r = find(&mut parent, i as u32) as usize;
         if minkey[r] != keys[i] {
@@ -727,14 +905,14 @@ fn main() {
     let (person_of, parsed) = std::thread::scope(|sc| {
         let h = sc.spawn(build_links);
     // ---------- events ----------
-    let esrc = Source::open(&data.join("events"), 8 << 20);
+    let esrc = Source::open(&data.join("events"), 2 << 20);
     let parsed: Vec<Parts<RawEv>> = esrc.run(|d| {
             let mut flat: Vec<RawEv> = Vec::with_capacity(d.len() / 64 + 1024);
             each_record::<7>(d, |[eid, uid, ts, ing, typ, pid, price]| {
                 if eid.is_empty() {
                     return;
                 }
-                let ek = key(eid);
+                let ek = ekey(eid);
                 let ingest = parse_ts(ing).unwrap_or(i64::MAX);
                 let tsv = parse_ts(ts);
                 let t = match typ {
@@ -775,13 +953,13 @@ fn main() {
                     valid = false;
                 }
                 let (pk, cat) = if valid {
-                    (key(uid), prod.get(pid).map(|x| x as u16).unwrap_or(unknown))
+                    (ukey(uid), if t == 2 { prod.get(pid).map(|x| x as u16).unwrap_or(unknown) } else { 0 })
                 } else {
                     (0, 0)
                 };
-                flat.push(RawEv { eid: ek, person: pk, ingest, ts: (tsv - ws) as u32, price: pr, cat, valid, typ: t });
+                flat.push(RawEv { eid: ek, person: pk, ingest, ts: (tsv - ws) as u32, pc: if t == 2 { (cat as u32) << 24 | pr } else { 0 } });
             });
-            Parts::build(&flat, |r| bucket(r.eid))
+            Parts::build(&flat, |r| bucket(r.eid as u128))
         });
     eprintln!("events parsed {:?}", t0.elapsed());
         (h.join().unwrap(), parsed)
@@ -794,9 +972,9 @@ fn main() {
             let cap = (total * 3 / 2 + 16).next_power_of_two();
             let mask = cap - 1;
             thread_local! {
-                static TAB: std::cell::RefCell<Vec<(u128, i64)>> = const { std::cell::RefCell::new(Vec::new()) };
+                static TAB: std::cell::RefCell<Vec<(u64, i64)>> = const { std::cell::RefCell::new(Vec::new()) };
             }
-            let mut tab: Vec<(u128, i64)> = TAB.with(|t| std::mem::take(&mut *t.borrow_mut()));
+            let mut tab: Vec<(u64, i64)> = TAB.with(|t| std::mem::take(&mut *t.borrow_mut()));
             if tab.len() < cap {
                 tab = vec![(0, 0); cap];
             }
@@ -809,9 +987,9 @@ fn main() {
             for c in parsed.iter() {
                 all.extend_from_slice(c.get(bi));
             }
-            let hs: Vec<u32> = all.iter().map(|r| (mix(r.eid) as usize & mask) as u32).collect();
+            let hs: Vec<u32> = all.iter().map(|r| (mix(r.eid as u128) as usize & mask) as u32).collect();
             const PFD: usize = 12;
-            let pf = |tab: &Vec<(u128, i64)>, h: u32| {
+            let pf = |tab: &Vec<(u64, i64)>, h: u32| {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
                     use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
@@ -839,7 +1017,7 @@ fn main() {
                     h = (h + 1) & mask;
                 }
             }
-            let mut v: Vec<RawEv> = Vec::with_capacity(total);
+            let mut out: Vec<Ev> = Vec::with_capacity(total);
             for i in 0..all.len() {
                 if i + PFD < all.len() {
                     pf(&tab, hs[i + PFD]);
@@ -851,8 +1029,8 @@ fn main() {
                     if s.0 == r.eid {
                         if s.1 == r.ingest {
                             s.1 = i64::MIN;
-                            if r.valid {
-                                v.push(*r);
+                            if r.person != 0 {
+                                out.push(Ev { person: r.person, ts: r.ts, pc: r.pc });
                             }
                         }
                         break;
@@ -868,24 +1046,22 @@ fn main() {
                 }
             }
             TAB.with(|t| *t.borrow_mut() = tab);
-            let w = v.len();
-            let mut out: Vec<Ev> = Vec::with_capacity(w);
+            drop(all);
+            let w = out.len();
             const PF: usize = 16;
             for i in 0..w {
                 if i + PF < w {
-                    person_of.prefetch(v[i + PF].person);
+                    person_of.prefetch(out[i + PF].person);
                 }
-                let r = v[i];
-                let p = person_of.get_or_self(r.person);
-                out.push(Ev { person: p, ts: r.ts, price: r.price, cat: r.cat, typ: r.typ });
+                out[i].person = person_of.get_or_self(out[i].person);
             }
-            Parts::build(&out, |e| bucket(e.person))
+            Parts::build(&out, |e| bucket(e.person as u128))
         });
     drop(parsed);
     eprintln!("events dedup {:?}", t0.elapsed());
 
     // ---------- clicks ----------
-    let csrc = Source::open(&data.join("clicks"), 8 << 20);
+    let csrc = Source::open(&data.join("clicks"), 2 << 20);
     let cl: Vec<Parts<Ck>> = csrc.run(|d| {
             let mut flat: Vec<Ck> = Vec::with_capacity(d.len() / 50);
             each_record::<4>(d, |[cid, uid, camp, ts]| {
@@ -897,7 +1073,7 @@ fn main() {
                     return;
                 }
                 let Some(ci) = camps.get(camp) else { return };
-                flat.push(Ck { person: key(uid), ts: t, cid: key(cid), camp: ci });
+                flat.push(Ck { person: ukey(uid), ts: (t - (ws - WEEK)) as u32, cid: ukey(cid), camp: ci });
             });
             const PF: usize = 16;
             for i in 0..flat.len() {
@@ -906,7 +1082,7 @@ fn main() {
                 }
                 flat[i].person = person_of.get_or_self(flat[i].person);
             }
-            Parts::build(&flat, |c| bucket(c.person))
+            Parts::build(&flat, |c| bucket(c.person as u128))
         });
     eprintln!("clicks parsed {:?}", t0.elapsed());
 
@@ -920,20 +1096,28 @@ fn main() {
         let mut rows: Vec<out::UserRow> = Vec::new();
         for bi in g * GB..(g + 1) * GB {
             let tq = std::time::Instant::now();
-            let evs: Vec<Ev> = gather_sorted(deduped.iter().map(|d| d.get(bi)), |e| e.person, |x, y| {
+            let nev: usize = deduped.iter().map(|d| d.get(bi).len()).sum();
+            let sbits = (usize::BITS - (nev / 4).max(1).leading_zeros()).clamp(1, 16);
+            let evs: Vec<Ev> = gather_sorted(deduped.iter().map(|d| d.get(bi)), sbits, |e| e.person as u128, |x, y| {
                 let (xp, yp) = (x.person, y.person);
                 xp < yp || (xp == yp && x.ts < y.ts)
             });
-            let mut cks: Vec<Ck> = Vec::new();
-            for c in &cl {
-                cks.extend_from_slice(c.get(bi));
-            }
+            let cks: Vec<Ck> = gather_sorted(cl.iter().map(|c| c.get(bi)), sbits, |c| c.person as u128, |x, y| {
+                let (xp, yp) = (x.person, y.person);
+                if xp != yp {
+                    return xp < yp;
+                }
+                let (xt, yt) = (x.ts, y.ts);
+                if xt != yt {
+                    return xt < yt;
+                }
+                ukey_cmp(x.cid, y.cid) == std::cmp::Ordering::Less
+            });
             PT[0].fetch_add(tq.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             let tq = std::time::Instant::now();
             // order = (12 hash bits of person, person, ts): counting sort on the
             // hash bits, then small sorts inside each sub-bucket
             PT[3].fetch_add(tq.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            sub_sort(&mut cks, |c| c.person, |x, y| (x.person, x.ts).cmp(&(y.person, y.ts)).then(key_cmp(x.cid, y.cid)));
             PT[1].fetch_add(tq.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             let tq = std::time::Instant::now();
             let mut catsum = vec![0i64; cat_rank.len()];
@@ -947,7 +1131,7 @@ fn main() {
                 while ie < evs.len() && evs[ie].person == p {
                     ie += 1;
                 }
-                while j < cks.len() && (hk(cks[j].person), cks[j].person) < (hk(p), p) {
+                while j < cks.len() && (sub_of(cks[j].person as u128, sbits), cks[j].person) < (sub_of(p as u128, sbits), p) {
                     j += 1;
                 }
                 let mut je = j;
@@ -1016,27 +1200,29 @@ fn main() {
                         d_rev = 0;
                     }
                     for e in &pe[k..ke] {
-                        if e.typ == 2 {
+                        if e.pc != 0 {
+                            let price = (e.pc & 0xFF_FFFF) as i64;
+                            let cat = (e.pc >> 24) as u16;
                             purch = true;
-                            rev += e.price as i64;
-                            if catsum[e.cat as usize] == 0 {
-                                touched.push(e.cat);
+                            rev += price;
+                            if catsum[cat as usize] == 0 {
+                                touched.push(cat);
                             }
-                            catsum[e.cat as usize] += e.price as i64;
+                            catsum[cat as usize] += price;
                         }
                     }
                     d_sess += 1;
                     d_ev += (ke - k) as i64;
                     d_rev += rev;
-                    while cp < pc.len() && pc[cp].ts <= start {
+                    while cp < pc.len() && pc[cp].ts as i64 + (ws - WEEK) <= start {
                         cp += 1;
                     }
                     let mut camp = ncamp;
                     if cp > 0 {
-                        let t = pc[cp - 1].ts;
+                        let t = pc[cp - 1].ts as i64 + (ws - WEEK);
                         if start - t <= WEEK {
                             let mut q = cp - 1;
-                            while q > 0 && pc[q - 1].ts == t {
+                            while q > 0 && pc[q - 1].ts as i64 + (ws - WEEK) == t {
                                 q -= 1;
                             }
                             camp = pc[q].camp as usize;
@@ -1053,7 +1239,7 @@ fn main() {
                 flush(cur_day, d_sess, d_ev, d_rev, &mut touched, &mut catsum, &mut rows);
                 if !pc.is_empty() {
                     cc.clear();
-                    cc.extend(pc.iter().map(|c| (c.camp, c.ts)));
+                    cc.extend(pc.iter().map(|c| (c.camp, c.ts as i64 + (ws - WEEK))));
                     cc.sort_unstable();
                     let mut a = 0;
                     while a < cc.len() {
@@ -1220,6 +1406,26 @@ mod tests {
         if v > i64::MAX as u128 { None } else { Some(v as i64) }
     }
     #[test]
+    fn ukey_order() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let alpha: Vec<u8> = b"uU0129az \x01\x7f".iter().copied().chain([0x80u8, 0xC3, 0xA9, 0]).collect();
+        let mut pool: Vec<Vec<u8>> = vec![];
+        for _ in 0..20000 {
+            let l = 1 + rnd() % 13;
+            pool.push((0..l).map(|_| alpha[(rnd() % alpha.len() as u64) as usize]).collect());
+        }
+        let keys: Vec<u64> = pool.iter().map(|p| ukey(p)).collect();
+        for _ in 0..400000 {
+            let i = (rnd() % pool.len() as u64) as usize;
+            let j = (rnd() % pool.len() as u64) as usize;
+            assert_eq!(ukey_cmp(keys[i], keys[j]), pool[i].cmp(&pool[j]));
+            assert_eq!(keys[i] == keys[j], pool[i] == pool[j]);
+            assert_eq!(ukey_bytes(keys[i]), pool[i]);
+            assert_eq!(keys[i], ukey_scalar(&pool[i]));
+        }
+    }
+    #[test]
     fn fuzz_ts() {
         let mut x: u64 = 0x1234_5678_9abc_def1;
         let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
@@ -1255,20 +1461,26 @@ mod tests {
 
 /// Gather the slices into one array ordered by (hk(key), then `less`), using a
 /// counting sort on the 12 hash bits and insertion sort inside each sub-bucket.
+#[inline]
+fn sub_of(k: u128, bits: u32) -> usize {
+    ((mix(k) >> 8) as usize) & ((1usize << bits) - 1)
+}
 fn gather_sorted<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
     src: I,
+    bits: u32,
     key: impl Fn(&T) -> u128,
     less: impl Fn(&T, &T) -> bool,
 ) -> Vec<T> {
-    let mut cnt = vec![0u32; 4097];
-    let mut n = 0usize;
+    let n: usize = src.clone().map(|s| s.len()).sum();
+    let nsub = 1usize << bits;
+    let sh = |k: u128| sub_of(k, bits);
+    let mut cnt = vec![0u32; nsub + 1];
     for sl in src.clone() {
-        n += sl.len();
         for x in sl {
-            cnt[hk(key(x)) as usize + 1] += 1;
+            cnt[sh(key(x)) + 1] += 1;
         }
     }
-    for i in 0..4096 {
+    for i in 0..nsub {
         cnt[i + 1] += cnt[i];
     }
     let starts = cnt.clone();
@@ -1276,12 +1488,12 @@ fn gather_sorted<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
     unsafe { out.set_len(n) };
     for sl in src {
         for x in sl {
-            let k = hk(key(x)) as usize;
+            let k = sh(key(x));
             out[cnt[k] as usize] = *x;
             cnt[k] += 1;
         }
     }
-    for i in 0..4096 {
+    for i in 0..nsub {
         let s = &mut out[starts[i] as usize..starts[i + 1] as usize];
         if s.len() > 32 {
             s.sort_unstable_by(|a, b| {
