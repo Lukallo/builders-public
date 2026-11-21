@@ -55,6 +55,13 @@ pub struct Source {
     files: Vec<File>,
     sizes: Vec<u64>,
     pub tasks: Vec<Task>,
+    maps: Vec<(*const u8, usize)>,
+}
+unsafe impl Sync for Source {}
+unsafe impl Send for Source {}
+unsafe extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
 }
 
 pub fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -93,15 +100,56 @@ impl Source {
             }
         }
         // biggest-first is not needed: tasks are uniform in size
-        Source { files, sizes, tasks }
+        let use_mmap = std::env::var_os("SS_PREAD").is_none();
+        let maps = files
+            .iter()
+            .zip(sizes.iter())
+            .map(|(f, &sz)| {
+                if !use_mmap || sz == 0 {
+                    return (std::ptr::null(), 0usize);
+                }
+                use std::os::unix::io::AsRawFd;
+                // PROT_READ=1, MAP_PRIVATE=2, MAP_POPULATE=0x8000
+                let p = unsafe { mmap(std::ptr::null_mut(), sz as usize, 1, 2, f.as_raw_fd(), 0) };
+                if p as isize == -1 {
+                    return (std::ptr::null(), 0usize);
+                }
+                unsafe { madvise(p, sz as usize, 2) }; // MADV_SEQUENTIAL
+                (p as *const u8, sz as usize)
+            })
+            .collect();
+        Source { files, sizes, tasks, maps }
     }
 
     /// Calls f once per task with a slice holding exactly the task's whole lines.
     pub fn run<T: Send, F: Fn(&[u8]) -> T + Sync>(&self, f: F) -> Vec<T> {
+        par_map(self.tasks.len(), |ti| self.run_one(ti, &f))
+    }
+
+    /// Runs f on task ti's whole lines.
+    pub fn run_one<T, F: Fn(&[u8]) -> T>(&self, ti: usize, f: &F) -> T {
         thread_local! {
             static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        par_map(self.tasks.len(), |ti| {
+        {
+            let t = &self.tasks[ti];
+            let (mp, ml) = self.maps[t.file];
+            if !mp.is_null() {
+                let d = unsafe { std::slice::from_raw_parts(mp, ml) };
+                let start = t.start as usize;
+                let end = t.end as usize;
+                // first line start
+                let first = if start == 0 {
+                    match d.iter().position(|&c| c == b'\n') { Some(p) => p + 1, None => ml }
+                } else {
+                    match d[start - 1..].iter().position(|&c| c == b'\n') { Some(p) => start - 1 + p + 1, None => ml }
+                };
+                if first >= end {
+                    return f(&[]);
+                }
+                let stop = match d[end - 1..].iter().position(|&c| c == b'\n') { Some(p) => end - 1 + p + 1, None => ml };
+                return f(&d[first..stop]);
+            }
             BUF.with(|b| {
                 let mut buf = b.borrow_mut();
                 let t = &self.tasks[ti];
@@ -162,7 +210,7 @@ impl Source {
                     return f(&buf[first..end]);
                 }
             })
-        })
+        }
     }
 }
 
@@ -306,4 +354,29 @@ pub fn each_record<const N: usize>(d: &[u8], mut f: impl FnMut([&[u8]; N])) {
     if ls < n {
         finish(ls, n, nc, &commas, nq);
     }
+}
+
+/// Like par_map, but each worker thread keeps one state built by `init`; tasks
+/// are taken in the given `order`. Returns the per-thread states.
+pub fn par_fold<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(order: &[usize], init: I, f: F) -> Vec<S> {
+    let next = AtomicUsize::new(0);
+    let nt = nthreads().min(order.len().max(1));
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..nt)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut st = init();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= order.len() {
+                            break;
+                        }
+                        f(&mut st, order[i]);
+                    }
+                    st
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }

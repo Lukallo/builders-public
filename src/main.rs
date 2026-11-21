@@ -8,7 +8,7 @@ mod alloc;
 mod out;
 #[global_allocator]
 static GLOBAL: alloc::Huge = alloc::Huge;
-mod par;
+pub mod par;
 use par::{each_record, par_map, Source};
 
 const SEC: i64 = 1000;
@@ -353,6 +353,21 @@ fn ukey_long(s: &[u8]) -> u64 {
     m.insert(s.to_vec(), k);
     k
 }
+/// Append the bytes of a user key to `out`.
+#[inline]
+pub fn ukey_put(k: u64, out: &mut Vec<u8>) {
+    if k >> 63 == 1 {
+        out.extend_from_slice(&ukey_bytes(k));
+        return;
+    }
+    for i in 0..9 {
+        let b = ((k >> (7 * (8 - i))) & 0x7F) as u8;
+        if b == 0 {
+            break;
+        }
+        out.push(b);
+    }
+}
 pub fn ukey_bytes(k: u64) -> Vec<u8> {
     if k >> 63 == 1 {
         return ULONG.lock().unwrap().as_ref().unwrap().1[(k & !(1u64 << 63)) as usize].clone();
@@ -366,6 +381,10 @@ pub fn ukey_bytes(k: u64) -> Vec<u8> {
         out.push(b);
     }
     out
+}
+/// Whether any ID needed interning (then u64 order is not byte order for those).
+pub fn any_interned() -> bool {
+    ULONG.lock().unwrap().as_ref().map(|x| !x.1.is_empty()).unwrap_or(false)
 }
 #[inline]
 pub fn ukey_cmp(a: u64, b: u64) -> std::cmp::Ordering {
@@ -666,6 +685,22 @@ impl<T: Copy> Parts<T> {
     pub fn get(&self, b: usize) -> &[T] {
         &self.data[self.off[b] as usize..self.off[b + 1] as usize]
     }
+    /// Scatter `flat` into NB buckets given each element's bucket and the counts.
+    pub fn from_keys(flat: &[T], ks: &[u16], counts: &[u32]) -> Parts<T> {
+        let mut cnt = vec![0u32; NB + 1];
+        for i in 0..NB {
+            cnt[i + 1] = cnt[i] + counts[i];
+        }
+        let off = cnt.clone();
+        let mut data: Vec<T> = Vec::with_capacity(flat.len());
+        unsafe { data.set_len(flat.len()) };
+        for (x, &k) in flat.iter().zip(ks.iter()) {
+            let c = &mut cnt[k as usize];
+            unsafe { *data.get_unchecked_mut(*c as usize) = *x };
+            *c += 1;
+        }
+        Parts { data, off }
+    }
     /// Counting sort of `flat` into NB buckets by `key`.
     pub fn build(flat: &[T], key: impl Fn(&T) -> usize) -> Parts<T> {
         let mut cnt = vec![0u32; NB + 1];
@@ -908,6 +943,8 @@ fn main() {
     let esrc = Source::open(&data.join("events"), 2 << 20);
     let parsed: Vec<Parts<RawEv>> = esrc.run(|d| {
             let mut flat: Vec<RawEv> = Vec::with_capacity(d.len() / 64 + 1024);
+            let mut ks: Vec<u16> = Vec::with_capacity(d.len() / 64 + 1024);
+            let mut counts = vec![0u32; NB];
             each_record::<7>(d, |[eid, uid, ts, ing, typ, pid, price]| {
                 if eid.is_empty() {
                     return;
@@ -957,15 +994,18 @@ fn main() {
                 } else {
                     (0, 0)
                 };
+                let b = bucket(ek as u128);
+                ks.push(b as u16);
+                counts[b] += 1;
                 flat.push(RawEv { eid: ek, person: pk, ingest, ts: (tsv - ws) as u32, pc: if t == 2 { (cat as u32) << 24 | pr } else { 0 } });
             });
-            Parts::build(&flat, |r| bucket(r.eid as u128))
+            Parts::from_keys(&flat, &ks, &counts)
         });
     eprintln!("events parsed {:?}", t0.elapsed());
         (h.join().unwrap(), parsed)
     });
 
-    let deduped: Vec<Parts<Ev>> = par_map(NB, |bi| {
+    let dedup_task = |bi: usize| -> Parts<Ev> {
             let total: usize = parsed.iter().map(|c| c.get(bi).len()).sum();
             // hash dedup, two sequential passes: min ingest per eid, then emit the
             // first valid copy carrying that ingest
@@ -1038,31 +1078,27 @@ fn main() {
                     h = (h + 1) & mask;
                 }
             }
-            for i in 0..all.len() {
-                let mut h = hs[i] as usize;
-                while tab[h].0 != 0 {
-                    tab[h].0 = 0;
-                    h = (h + 1) & mask;
-                }
-            }
+            tab.fill((0, 0));
             TAB.with(|t| *t.borrow_mut() = tab);
             drop(all);
             let w = out.len();
             const PF: usize = 16;
+            let mut ks: Vec<u16> = Vec::with_capacity(w);
+            let mut counts = vec![0u32; NB];
             for i in 0..w {
                 if i + PF < w {
                     person_of.prefetch(out[i + PF].person);
                 }
-                out[i].person = person_of.get_or_self(out[i].person);
+                let p = person_of.get_or_self(out[i].person);
+                out[i].person = p;
+                let b = bucket(p as u128);
+                ks.push(b as u16);
+                counts[b] += 1;
             }
-            Parts::build(&out, |e| bucket(e.person as u128))
-        });
-    drop(parsed);
-    eprintln!("events dedup {:?}", t0.elapsed());
-
-    // ---------- clicks ----------
+            Parts::from_keys(&out, &ks, &counts)
+        };
     let csrc = Source::open(&data.join("clicks"), 2 << 20);
-    let cl: Vec<Parts<Ck>> = csrc.run(|d| {
+    let click_task = |d: &[u8]| -> Parts<Ck> {
             let mut flat: Vec<Ck> = Vec::with_capacity(d.len() / 50);
             each_record::<4>(d, |[cid, uid, camp, ts]| {
                 if cid.is_empty() || uid.is_empty() {
@@ -1076,33 +1112,77 @@ fn main() {
                 flat.push(Ck { person: ukey(uid), ts: (t - (ws - WEEK)) as u32, cid: ukey(cid), camp: ci });
             });
             const PF: usize = 16;
+            let mut ks: Vec<u16> = Vec::with_capacity(flat.len());
+            let mut counts = vec![0u32; NB];
             for i in 0..flat.len() {
                 if i + PF < flat.len() {
                     person_of.prefetch(flat[i + PF].person);
                 }
-                flat[i].person = person_of.get_or_self(flat[i].person);
+                let p = person_of.get_or_self(flat[i].person);
+                flat[i].person = p;
+                let b = bucket(p as u128);
+                ks.push(b as u16);
+                counts[b] += 1;
             }
-            Parts::build(&flat, |c| bucket(c.person as u128))
-        });
+            Parts::from_keys(&flat, &ks, &counts)
+        };
+    // clicks parsing and event dedup share one pool (one barrier less)
+    enum Out {
+        E(Parts<Ev>),
+        C(Parts<Ck>),
+    }
+    let nct = csrc.tasks.len();
+    let mixed: Vec<Out> = par_map(nct + NB, |i| if i < nct { Out::C(csrc.run_one(i, &click_task)) } else { Out::E(dedup_task(i - nct)) });
+    let mut deduped: Vec<Parts<Ev>> = Vec::with_capacity(NB);
+    let mut cl: Vec<Parts<Ck>> = Vec::with_capacity(nct);
+    for o in mixed {
+        match o {
+            Out::E(p) => deduped.push(p),
+            Out::C(p) => cl.push(p),
+        }
+    }
+    drop(parsed);
+
+    eprintln!("events dedup {:?}", t0.elapsed());
+
+    // ---------- clicks ----------
     eprintln!("clicks parsed {:?}", t0.elapsed());
 
     // ---------- per person ----------
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
     let ncols = ncamp + 1; // organic = ncamp
+    let interned = any_interned();
     const GB: usize = 32; // buckets per task
-    let results: Vec<(Vec<out::UserRow>, Vec<[i64; 4]>)> = par_map(NB / GB, |g| {
-        let mut camp_acc = vec![[0i64; 4]; ncols * ndays];
-        let mut rows: Vec<out::UserRow> = Vec::new();
-        for bi in g * GB..(g + 1) * GB {
+    let _ = GB;
+    // one task per person bucket, largest first (whale persons), so no thread
+    // is left with a big bucket at the end; per-thread accumulators
+    let sizes: Vec<usize> = (0..NB)
+        .map(|bi| deduped.iter().map(|d| d.get(bi).len()).sum::<usize>() + cl.iter().map(|c| c.get(bi).len()).sum::<usize>())
+        .collect();
+    let mut order: Vec<usize> = (0..NB).collect();
+    order.sort_by_key(|&b| std::cmp::Reverse(sizes[b]));
+    let results: Vec<(Vec<out::UserRow>, Vec<[i64; 4]>)> = par::par_fold(&order, || (Vec::<out::UserRow>::new(), vec![[0i64; 4]; ncols * ndays]), |st, bi| {
+        let (rows, camp_acc) = (&mut st.0, &mut st.1);
+        {
             let tq = std::time::Instant::now();
             let nev: usize = deduped.iter().map(|d| d.get(bi).len()).sum();
             let sbits = (usize::BITS - (nev / 4).max(1).leading_zeros()).clamp(1, 16);
-            let evs: Vec<Ev> = gather_sorted(deduped.iter().map(|d| d.get(bi)), sbits, |e| e.person as u128, |x, y| {
+            let _ = sbits;
+            let evs: Vec<Ev> = radix_gather(deduped.iter().map(|d| d.get(bi)), |e| h16(e.person) << 32 | e.ts as u64, |x, y| {
+                let (hx, hy) = (h16(x.person), h16(y.person));
+                if hx != hy {
+                    return hx < hy;
+                }
                 let (xp, yp) = (x.person, y.person);
                 xp < yp || (xp == yp && x.ts < y.ts)
             });
-            let cks: Vec<Ck> = gather_sorted(cl.iter().map(|c| c.get(bi)), sbits, |c| c.person as u128, |x, y| {
+            let _ = interned;
+            let cks: Vec<Ck> = radix_gather(cl.iter().map(|c| c.get(bi)), |c| h16(c.person) << 32 | c.ts as u64, |x, y| {
+                let (hx, hy) = (h16(x.person), h16(y.person));
+                if hx != hy {
+                    return hx < hy;
+                }
                 let (xp, yp) = (x.person, y.person);
                 if xp != yp {
                     return xp < yp;
@@ -1131,7 +1211,7 @@ fn main() {
                 while ie < evs.len() && evs[ie].person == p {
                     ie += 1;
                 }
-                while j < cks.len() && (sub_of(cks[j].person as u128, sbits), cks[j].person) < (sub_of(p as u128, sbits), p) {
+                while j < cks.len() && (h16(cks[j].person), cks[j].person) < (h16(p), p) {
                     j += 1;
                 }
                 let mut je = j;
@@ -1193,7 +1273,7 @@ fn main() {
                     let mut purch = false;
                     let sday = start.div_euclid(DAY);
                     if sday != cur_day {
-                        flush(cur_day, d_sess, d_ev, d_rev, &mut touched, &mut catsum, &mut rows);
+                        flush(cur_day, d_sess, d_ev, d_rev, &mut touched, &mut catsum, rows);
                         cur_day = sday;
                         d_sess = 0;
                         d_ev = 0;
@@ -1236,7 +1316,7 @@ fn main() {
                     starts.push(start);
                     k = ke;
                 }
-                flush(cur_day, d_sess, d_ev, d_rev, &mut touched, &mut catsum, &mut rows);
+                flush(cur_day, d_sess, d_ev, d_rev, &mut touched, &mut catsum, rows);
                 if !pc.is_empty() {
                     cc.clear();
                     cc.extend(pc.iter().map(|c| (c.camp, c.ts as i64 + (ws - WEEK))));
@@ -1276,7 +1356,6 @@ fn main() {
             }
             PT[2].fetch_add(tq.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        (rows, camp_acc)
         });
     eprintln!("sessions {:?}", t0.elapsed());
     eprintln!("  sess cpu: evsort {}ms gather {}ms prep {}ms loop {}ms", PT[3].load(std::sync::atomic::Ordering::Relaxed)/1000000, PT[0].load(std::sync::atomic::Ordering::Relaxed)/1000000, PT[1].load(std::sync::atomic::Ordering::Relaxed)/1000000, PT[2].load(std::sync::atomic::Ordering::Relaxed)/1000000);
@@ -1311,11 +1390,13 @@ fn main() {
     }
     out::write_all(&outdir, all_rows, camp_rows, &cat_names);
     eprintln!("done {:?}", t0.elapsed());
+    // skip destructors of the large arrays: the OS reclaims them at exit
+    std::process::exit(0);
 }
 
 /// LSD radix sort of (key, payload) pairs by key, over the low `bits` bits.
 fn radix_sort(a: &mut Vec<(u64, u64)>, bits: u32) {
-    const D: u32 = 11;
+    const D: u32 = 8;
     let n = a.len();
     if n < 64 {
         a.sort_unstable_by_key(|x| x.0);
@@ -1465,19 +1546,23 @@ mod tests {
 fn sub_of(k: u128, bits: u32) -> usize {
     ((mix(k) >> 8) as usize) & ((1usize << bits) - 1)
 }
-fn gather_sorted<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
+fn gather_sorted<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone, K: Ord + Copy>(
     src: I,
     bits: u32,
     key: impl Fn(&T) -> u128,
     less: impl Fn(&T, &T) -> bool,
+    big_key: impl Fn(&T) -> K,
+    fix: bool,
 ) -> Vec<T> {
     let n: usize = src.clone().map(|s| s.len()).sum();
     let nsub = 1usize << bits;
-    let sh = |k: u128| sub_of(k, bits);
+    let mut ks: Vec<u32> = Vec::with_capacity(n);
     let mut cnt = vec![0u32; nsub + 1];
     for sl in src.clone() {
         for x in sl {
-            cnt[sh(key(x)) + 1] += 1;
+            let k = sub_of(key(x), bits) as u32;
+            ks.push(k);
+            cnt[k as usize + 1] += 1;
         }
     }
     for i in 0..nsub {
@@ -1486,26 +1571,23 @@ fn gather_sorted<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
     let starts = cnt.clone();
     let mut out: Vec<T> = Vec::with_capacity(n);
     unsafe { out.set_len(n) };
+    let mut j = 0;
     for sl in src {
         for x in sl {
-            let k = sh(key(x));
+            let k = ks[j] as usize;
+            j += 1;
             out[cnt[k] as usize] = *x;
             cnt[k] += 1;
         }
     }
     for i in 0..nsub {
         let s = &mut out[starts[i] as usize..starts[i + 1] as usize];
-        if s.len() > 32 {
-            s.sort_unstable_by(|a, b| {
-                if less(a, b) {
-                    std::cmp::Ordering::Less
-                } else if less(b, a) {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            });
-            continue;
+        if s.len() > 24 {
+            s.sort_unstable_by_key(|x| big_key(x));
+            if !fix {
+                continue;
+            }
+            // exact order with the comparator (cheap on nearly sorted data)
         }
         for a in 1..s.len() {
             let x = s[a];
@@ -1518,4 +1600,75 @@ fn gather_sorted<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
         }
     }
     out
+}
+
+/// Gather the slices and order them by (16-bit person hash, person, ts, ...):
+/// LSD radix sort on (hash16 << 32 | ts), then an exact insertion pass with
+/// `less` (fixes persons sharing a hash and ties; near-linear on sorted data).
+fn radix_gather<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
+    src: I,
+    key: impl Fn(&T) -> u64,
+    less: impl Fn(&T, &T) -> bool,
+) -> Vec<T> {
+    let n: usize = src.clone().map(|s| s.len()).sum();
+    let mut a: Vec<T> = Vec::with_capacity(n);
+    let mut ka: Vec<u64> = Vec::with_capacity(n);
+    for sl in src {
+        for x in sl {
+            ka.push(key(x));
+        }
+        a.extend_from_slice(sl);
+    }
+    let mut b: Vec<T> = Vec::with_capacity(n);
+    unsafe { b.set_len(n) };
+    let mut kb: Vec<u64> = Vec::with_capacity(n);
+    unsafe { kb.set_len(n) };
+    const D: u32 = 8;
+    let mut shift = 0;
+    while shift < 48 {
+        let mut cnt = [0u32; 1 << D];
+        for &k in ka.iter() {
+            cnt[((k >> shift) & ((1 << D) - 1)) as usize] += 1;
+        }
+        if cnt.iter().any(|&c| c as usize == n) {
+            shift += D;
+            continue;
+        }
+        let mut sum = 0u32;
+        for c in cnt.iter_mut() {
+            let t = *c;
+            *c = sum;
+            sum += t;
+        }
+        for i in 0..n {
+            let k = ka[i];
+            let d = ((k >> shift) & ((1 << D) - 1)) as usize;
+            let p = cnt[d] as usize;
+            unsafe {
+                *kb.get_unchecked_mut(p) = k;
+                *b.get_unchecked_mut(p) = *a.get_unchecked(i);
+            }
+            cnt[d] += 1;
+        }
+        std::mem::swap(&mut a, &mut b);
+        std::mem::swap(&mut ka, &mut kb);
+        shift += D;
+    }
+    // exact fix-up
+    for i in 1..n {
+        if less(&a[i], &a[i - 1]) {
+            let x = a[i];
+            let mut j = i;
+            while j > 0 && less(&x, &a[j - 1]) {
+                a[j] = a[j - 1];
+                j -= 1;
+            }
+            a[j] = x;
+        }
+    }
+    a
+}
+#[inline]
+fn h16(p: u64) -> u64 {
+    (mix(p as u128) >> 8) & 0xFFFF
 }

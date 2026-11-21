@@ -255,7 +255,11 @@ fn write_user(path: &Path, rows: &[UserRow], cats: &[Vec<u8>]) {
     let mut top = Vec::with_capacity(n * 8);
     let mut defs = Vec::with_capacity(n);
     for r in rows {
-        put_bytes(&mut ids, &crate::ukey_bytes(r.person));
+        let at = ids.len();
+        ids.extend_from_slice(&[0u8; 4]);
+        crate::ukey_put(r.person, &mut ids);
+        let len = (ids.len() - at - 4) as u32;
+        ids[at..at + 4].copy_from_slice(&len.to_le_bytes());
         days.extend_from_slice(&r.day.to_le_bytes());
         ses.extend_from_slice(&r.sessions.to_le_bytes());
         evs.extend_from_slice(&r.events.to_le_bytes());
@@ -323,11 +327,11 @@ pub fn write_all(out: &Path, users: Vec<Vec<UserRow>>, camps: Vec<CampRow>, cats
     let cd = out.join("campaign_daily");
     std::fs::create_dir_all(&ud).unwrap();
     std::fs::create_dir_all(&cd).unwrap();
-    // group the per-bucket row vectors into a few files of similar size
-    let nfiles = 16usize.min(users.len().max(1));
-    let mut groups: Vec<Vec<UserRow>> = (0..nfiles).map(|_| vec![]).collect();
-    for (i, u) in users.into_iter().enumerate() {
-        groups[i % nfiles].extend(u);
+    // one file per task's row vector (no regrouping copy); empty ones skipped
+    let groups: Vec<Vec<UserRow>> = users.into_iter().filter(|u| !u.is_empty()).collect();
+    let nfiles = groups.len();
+    if nfiles == 0 {
+        write_user(&ud.join("part-000.parquet"), &[], cats);
     }
     let camps_slot = std::sync::Mutex::new(Some(camps));
     par_map(nfiles + 1, |i| {
