@@ -1162,14 +1162,16 @@ fn main() {
         .collect();
     let mut order: Vec<usize> = (0..NB).collect();
     order.sort_by_key(|&b| std::cmp::Reverse(sizes[b]));
-    let results: Vec<(Vec<out::UserRow>, Vec<[i64; 4]>)> = par::par_fold(&order, || (Vec::<out::UserRow>::new(), vec![[0i64; 4]; ncols * ndays]), |st, bi| {
-        let (rows, camp_acc) = (&mut st.0, &mut st.1);
+    // per thread: user rows, credited (sessions, purchasing, revenue), assisted
+    type Acc = (Vec<out::UserRow>, Vec<(u32, u32, u64)>, Vec<u32>);
+    let results: Vec<Acc> = par::par_fold(&order, || -> Acc { (Vec::new(), vec![(0, 0, 0); ncols * ndays], vec![0; ncols * ndays]) }, |st, bi| {
+        let (rows, credit, assist) = (&mut st.0, &mut st.1, &mut st.2);
         {
             let tq = std::time::Instant::now();
             let nev: usize = deduped.iter().map(|d| d.get(bi).len()).sum();
             let sbits = (usize::BITS - (nev / 4).max(1).leading_zeros()).clamp(1, 16);
             let _ = sbits;
-            let evs: Vec<Ev> = radix_gather(deduped.iter().map(|d| d.get(bi)), |e| h16(e.person) << 32 | e.ts as u64, |x, y| {
+            let evs: Vec<Ev> = radix_gather(deduped.iter().map(|d| d.get(bi)), |e| h16(e.person) << 16 | (e.ts >> 16) as u64, |x, y| {
                 let (hx, hy) = (h16(x.person), h16(y.person));
                 if hx != hy {
                     return hx < hy;
@@ -1178,7 +1180,7 @@ fn main() {
                 xp < yp || (xp == yp && x.ts < y.ts)
             });
             let _ = interned;
-            let cks: Vec<Ck> = radix_gather(cl.iter().map(|c| c.get(bi)), |c| h16(c.person) << 32 | c.ts as u64, |x, y| {
+            let cks: Vec<Ck> = radix_gather(cl.iter().map(|c| c.get(bi)), |c| h16(c.person) << 16 | (c.ts >> 16) as u64, |x, y| {
                 let (hx, hy) = (h16(x.person), h16(y.person));
                 if hx != hy {
                     return hx < hy;
@@ -1309,10 +1311,10 @@ fn main() {
                         }
                     }
                     let di = (sday - day0) as usize;
-                    let a = &mut camp_acc[camp * ndays + di];
-                    a[0] += 1;
-                    a[1] += purch as i64;
-                    a[2] += rev;
+                    let a = &mut credit[camp * ndays + di];
+                    a.0 += 1;
+                    a.1 += purch as u32;
+                    a.2 += rev as u64;
                     starts.push(start);
                     k = ke;
                 }
@@ -1343,7 +1345,7 @@ fn main() {
                                 let d = starts[s].div_euclid(DAY);
                                 let dend = (d + 1) * DAY;
                                 let m = s + starts[s..e].partition_point(|&t| t < dend);
-                                camp_acc[camp as usize * ndays + (d - day0) as usize][3] += (m - s) as i64;
+                                assist[camp as usize * ndays + (d - day0) as usize] += (m - s) as u32;
                                 s = m;
                             }
                             x = y;
@@ -1361,11 +1363,12 @@ fn main() {
     eprintln!("  sess cpu: evsort {}ms gather {}ms prep {}ms loop {}ms", PT[3].load(std::sync::atomic::Ordering::Relaxed)/1000000, PT[0].load(std::sync::atomic::Ordering::Relaxed)/1000000, PT[1].load(std::sync::atomic::Ordering::Relaxed)/1000000, PT[2].load(std::sync::atomic::Ordering::Relaxed)/1000000);
     let mut camp_acc = vec![[0i64; 4]; ncols * ndays];
     let mut all_rows: Vec<Vec<out::UserRow>> = vec![];
-    for (r, c) in results {
-        for (x, y) in camp_acc.iter_mut().zip(c.iter()) {
-            for q in 0..4 {
-                x[q] += y[q];
-            }
+    for (r, c, a) in results {
+        for ((x, y), z) in camp_acc.iter_mut().zip(c.iter()).zip(a.iter()) {
+            x[0] += y.0 as i64;
+            x[1] += y.1 as i64;
+            x[2] += y.2 as i64;
+            x[3] += *z as i64;
         }
         all_rows.push(r);
     }
@@ -1612,22 +1615,18 @@ fn radix_gather<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
 ) -> Vec<T> {
     let n: usize = src.clone().map(|s| s.len()).sum();
     let mut a: Vec<T> = Vec::with_capacity(n);
-    let mut ka: Vec<u64> = Vec::with_capacity(n);
     for sl in src {
-        for x in sl {
-            ka.push(key(x));
-        }
         a.extend_from_slice(sl);
     }
-    let mut b: Vec<T> = Vec::with_capacity(n);
-    unsafe { b.set_len(n) };
-    let mut kb: Vec<u64> = Vec::with_capacity(n);
-    unsafe { kb.set_len(n) };
-    const D: u32 = 8;
-    let mut shift = 0;
-    while shift < 48 {
+    // sort packed words (32-bit key << 32 | index): 3 LSD passes of 11 bits
+    let mut w: Vec<u64> = a.iter().enumerate().map(|(i, x)| (key(x) << 32) | i as u64).collect();
+    let mut w2: Vec<u64> = Vec::with_capacity(n);
+    unsafe { w2.set_len(n) };
+    const D: u32 = 11;
+    let mut shift = 32;
+    while shift < 64 {
         let mut cnt = [0u32; 1 << D];
-        for &k in ka.iter() {
+        for &k in w.iter() {
             cnt[((k >> shift) & ((1 << D) - 1)) as usize] += 1;
         }
         if cnt.iter().any(|&c| c as usize == n) {
@@ -1640,35 +1639,88 @@ fn radix_gather<'a, T: Copy + 'a, I: Iterator<Item = &'a [T]> + Clone>(
             *c = sum;
             sum += t;
         }
-        for i in 0..n {
-            let k = ka[i];
+        for &k in w.iter() {
             let d = ((k >> shift) & ((1 << D) - 1)) as usize;
-            let p = cnt[d] as usize;
-            unsafe {
-                *kb.get_unchecked_mut(p) = k;
-                *b.get_unchecked_mut(p) = *a.get_unchecked(i);
-            }
+            unsafe { *w2.get_unchecked_mut(cnt[d] as usize) = k };
             cnt[d] += 1;
         }
-        std::mem::swap(&mut a, &mut b);
-        std::mem::swap(&mut ka, &mut kb);
+        std::mem::swap(&mut w, &mut w2);
         shift += D;
+    }
+    let mut out: Vec<T> = Vec::with_capacity(n);
+    for &k in w.iter() {
+        out.push(unsafe { *a.get_unchecked((k & 0xFFFF_FFFF) as usize) });
     }
     // exact fix-up
     for i in 1..n {
-        if less(&a[i], &a[i - 1]) {
-            let x = a[i];
+        if less(&out[i], &out[i - 1]) {
+            let x = out[i];
             let mut j = i;
-            while j > 0 && less(&x, &a[j - 1]) {
-                a[j] = a[j - 1];
+            while j > 0 && less(&x, &out[j - 1]) {
+                out[j] = out[j - 1];
                 j -= 1;
             }
-            a[j] = x;
+            out[j] = x;
         }
     }
-    a
+    out
 }
 #[inline]
 fn h16(p: u64) -> u64 {
     (mix(p as u128) >> 8) & 0xFFFF
+}
+#[cfg(test)]
+mod bench_tok {
+    #[test]
+    fn tok_speed() {
+        let p = std::env::var("TOKFILE").unwrap_or_default();
+        if p.is_empty() { return; }
+        let d = std::fs::read(&p).unwrap();
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            let n = crate::par::count_seps(&d);
+            eprintln!("masks+popcnt only {:.2} GB/s ({n})", d.len() as f64 / t.elapsed().as_secs_f64() / 1e9);
+        }
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            let mut acc = 0u64;
+            crate::par::each_record::<7>(&d, |[a, _b, _c, _d, _e, _f, _g]| { acc += a.len() as u64; });
+            eprintln!("each_record {:.2} GB/s ({acc})", d.len() as f64 / t.elapsed().as_secs_f64() / 1e9);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tok_equiv {
+    #[test]
+    fn tokenizer_matches_reference() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let alpha = b"ab,\"\n,,x\"1\n\"\"";
+        for it in 0..40000 {
+            let len = (rnd() % 300) as usize;
+            let mut d: Vec<u8> = (0..len).map(|_| alpha[(rnd() % alpha.len() as u64) as usize]).collect();
+            if it % 2 == 0 {
+                d.clear();
+                for _ in 0..(rnd() % 20) {
+                    let fields: Vec<String> = (0..(5 + rnd() % 4)).map(|_| {
+                        let v = if rnd() % 7 == 0 { String::new() } else { format!("v{}", rnd() % 100) };
+                        match rnd() % 9 { 0 => format!("\"{v}\""), 1 => format!("\"{v}"), 2 => format!("{v}\""), 3 => format!("\"{v}\"\""), _ => v }
+                    }).collect();
+                    d.extend_from_slice(fields.join(",").as_bytes());
+                    if rnd() % 10 != 0 { d.push(b'\n'); }
+                }
+            }
+            for n in [7usize, 2, 4] {
+                let mut a: Vec<Vec<Vec<u8>>> = vec![];
+                let mut b: Vec<Vec<Vec<u8>>> = vec![];
+                match n {
+                    7 => { crate::par::each_record_old::<7>(&d, |fs| a.push(fs.iter().map(|x| x.to_vec()).collect())); crate::par::each_record::<7>(&d, |fs| b.push(fs.iter().map(|x| x.to_vec()).collect())); }
+                    2 => { crate::par::each_record_old::<2>(&d, |fs| a.push(fs.iter().map(|x| x.to_vec()).collect())); crate::par::each_record::<2>(&d, |fs| b.push(fs.iter().map(|x| x.to_vec()).collect())); }
+                    _ => { crate::par::each_record_old::<4>(&d, |fs| a.push(fs.iter().map(|x| x.to_vec()).collect())); crate::par::each_record::<4>(&d, |fs| b.push(fs.iter().map(|x| x.to_vec()).collect())); }
+                }
+                assert_eq!(a, b, "N={n} {:?}", String::from_utf8_lossy(&d));
+            }
+        }
+    }
 }

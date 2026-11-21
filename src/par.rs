@@ -285,9 +285,10 @@ fn masks64(b: &[u8]) -> (u64, u64, u64) {
     (c, n, q)
 }
 
-/// Calls f with the N fields (quotes removed) of every well-formed line in d.
+/// Reference tokenizer (kept for tests).
+#[allow(dead_code)]
 #[inline(always)]
-pub fn each_record<const N: usize>(d: &[u8], mut f: impl FnMut([&[u8]; N])) {
+pub fn each_record_old<const N: usize>(d: &[u8], mut f: impl FnMut([&[u8]; N])) {
     let n = d.len();
     let mut commas = [0usize; 16];
     let mut nc = 0usize;
@@ -379,4 +380,109 @@ pub fn par_fold<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(order
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
+}
+
+#[allow(dead_code)]
+pub fn count_seps(d: &[u8]) -> u64 {
+    let mut n = 0u64;
+    let mut base = 0;
+    while base < d.len() {
+        let (c, l, q) = masks(d, base);
+        n += (c | l).count_ones() as u64 + q.count_ones() as u64;
+        base += 64;
+    }
+    n
+}
+
+/// Calls f with the N fields (quotes removed) of every well-formed line in d.
+/// Quotes are counted per field from the bitmasks, so the byte checks run only
+/// for fields that contain quotes.
+#[inline(always)]
+pub fn each_record<const N: usize>(d: &[u8], mut f: impl FnMut([&[u8]; N])) {
+    let n = d.len();
+    let mut seps = [0usize; 16];
+    let mut qf = [0u32; 16];
+    let mut nc = 0usize; // separators seen in the current line (commas)
+    let mut anyq = 0u32;
+    let mut cur_q = 0u32;
+    let mut ls = 0usize;
+    let mut base = 0usize;
+    #[inline(always)]
+    fn emit<const N: usize>(
+        d: &[u8],
+        ls: usize,
+        end: usize,
+        nc: usize,
+        seps: &[usize; 16],
+        qf: &[u32; 16],
+        anyq: u32,
+        f: &mut impl FnMut([&[u8]; N]),
+    ) {
+        if nc != N - 1 {
+            return;
+        }
+        let mut out: [&[u8]; N] = [&[]; N];
+        let mut s = ls;
+        if anyq == 0 {
+            for k in 0..N {
+                let e = if k < N - 1 { seps[k] } else { end };
+                out[k] = unsafe { d.get_unchecked(s..e) };
+                s = e + 1;
+            }
+            f(out);
+            return;
+        }
+        // branchless per-field quote validation and stripping
+        let last_ix = d.len() - 1;
+        let mut bad = false;
+        for k in 0..N {
+            let e = if k < N - 1 { seps[k] } else { end };
+            let l = e - s;
+            let q = qf[k];
+            let first = unsafe { *d.get_unchecked(s.min(last_ix)) };
+            let last = unsafe { *d.get_unchecked(e.saturating_sub(1).min(last_ix)) };
+            let pair = (q == 2) & (l >= 2) & (first == b'"') & (last == b'"');
+            bad |= (q != 0) & !pair;
+            let adj = pair as usize;
+            out[k] = unsafe { d.get_unchecked(s + adj..e - adj) };
+            s = e + 1;
+        }
+        if !bad {
+            f(out);
+        }
+    }
+    while base < n {
+        let (mc, mn, mut mq) = masks(d, base);
+        let mut m = mc | mn;
+        while m != 0 {
+            let b = m.trailing_zeros();
+            let below = (1u64 << b) - 1;
+            let qb = (mq & below).count_ones();
+            cur_q += qb;
+            mq &= !below;
+            let p = base + b as usize;
+            if (mn >> b) & 1 == 1 {
+                qf[nc & 15] = cur_q;
+                anyq |= cur_q;
+                emit::<N>(d, ls, p, nc, &seps, &qf, anyq, &mut f);
+                ls = p + 1;
+                nc = 0;
+                anyq = 0;
+            } else {
+                seps[nc & 15] = p;
+                qf[nc & 15] = cur_q;
+                anyq |= cur_q;
+                nc += 1;
+            }
+            cur_q = 0;
+            m &= m - 1;
+        }
+        cur_q += mq.count_ones();
+        base += 64;
+    }
+    if ls < n {
+        qf[nc & 15] = cur_q;
+        anyq |= cur_q;
+        emit::<N>(d, ls, n, nc, &seps, &qf, anyq, &mut f);
+    }
 }
