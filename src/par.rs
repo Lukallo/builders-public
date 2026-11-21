@@ -111,7 +111,12 @@ impl Source {
                 let mut want = (t.end + 65536).min(size);
                 loop {
                     let len = (want - from) as usize;
-                    buf.resize(len, 0);
+                    if buf.capacity() < len {
+                        let cur = buf.len();
+                        buf.reserve(len - cur);
+                    }
+                    // SAFETY: bytes are fully written by read_full before use
+                    unsafe { buf.set_len(len) };
                     read_full(file, &mut buf[..len], from);
                     // first line start
                     let first = if t.start == 0 {
@@ -204,7 +209,23 @@ fn masks64(b: &[u8]) -> (u64, u64, u64) {
         )
     }
 }
-#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw")))]
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
+#[inline(always)]
+fn masks64(b: &[u8]) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let lo = _mm256_loadu_si256(b.as_ptr() as *const _);
+        let hi = _mm256_loadu_si256(b.as_ptr().add(32) as *const _);
+        let m = |c: u8| {
+            let cv = _mm256_set1_epi8(c as i8);
+            let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, cv)) as u32 as u64;
+            let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, cv)) as u32 as u64;
+            a | (b << 32)
+        };
+        (m(b','), m(b'\n'), m(b'"'))
+    }
+}
+#[cfg(not(all(target_arch = "x86_64", any(target_feature = "avx512bw", target_feature = "avx2"))))]
 #[inline(always)]
 fn masks64(b: &[u8]) -> (u64, u64, u64) {
     let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
@@ -223,59 +244,66 @@ pub fn each_record<const N: usize>(d: &[u8], mut f: impl FnMut([&[u8]; N])) {
     let mut commas = [0usize; 16];
     let mut nc = 0usize;
     let mut ls = 0usize;
-    let mut quoted = false;
+    let mut nq = 0u32;
     let mut base = 0usize;
-    let mut finish = |ls: usize, end: usize, nc: usize, commas: &[usize; 16], quoted: bool| {
+    let mut finish = |ls: usize, end: usize, nc: usize, commas: &[usize; 16], nq: u32| {
         if nc != N - 1 {
-            return;
-        }
-        let line = &d[ls..end];
-        if quoted {
-            if let Some(fs) = crate::split::<N>(line) {
-                f(fs);
-            }
             return;
         }
         let mut out: [&[u8]; N] = [&[]; N];
         let mut s = ls;
-        for k in 0..N - 1 {
-            out[k] = &d[s..commas[k]];
-            s = commas[k] + 1;
+        for k in 0..N {
+            let e = if k < N - 1 { commas[k] } else { end };
+            out[k] = &d[s..e];
+            s = e + 1;
         }
-        out[N - 1] = &d[s..end];
+        if nq != 0 {
+            // valid iff every quote is a matched pair around a whole field
+            let mut paired = 0u32;
+            for fld in out.iter_mut() {
+                let l = fld.len();
+                if l >= 2 && fld[0] == b'"' && fld[l - 1] == b'"' {
+                    paired += 2;
+                    *fld = &fld[1..l - 1];
+                }
+            }
+            if paired != nq {
+                return;
+            }
+        }
         f(out);
     };
     while base < n {
-        let (mc, mn, mq) = masks(d, base);
-        let mut m = mc | mn;
-        let mut qrem = mq;
-        while m != 0 {
-            let b = m.trailing_zeros() as usize;
-            let below = qrem & ((1u64 << b) - 1);
-            if below != 0 {
-                quoted = true;
-                qrem &= !below;
-            }
-            let p = base + b;
-            if (mn >> b) & 1 == 1 {
-                finish(ls, p, nc, &commas, quoted);
-                ls = p + 1;
-                nc = 0;
-                quoted = false;
-            } else {
-                if nc < 16 {
-                    commas[nc] = p;
-                }
+        let (mut mc, mut mn, mut mq) = masks(d, base);
+        while mn != 0 {
+            let b = mn.trailing_zeros();
+            let below = (1u64 << b) - 1;
+            let mut cm = mc & below;
+            while cm != 0 {
+                commas[nc & 15] = base + cm.trailing_zeros() as usize;
                 nc += 1;
+                cm &= cm - 1;
             }
-            m &= m - 1;
+            nq += (mq & below).count_ones();
+            let p = base + b as usize;
+            finish(ls, p, nc, &commas, nq);
+            ls = p + 1;
+            nc = 0;
+            nq = 0;
+            let keep = !(below | (1u64 << b));
+            mc &= keep;
+            mq &= keep;
+            mn &= mn - 1;
         }
-        if qrem != 0 {
-            quoted = true;
+        while mc != 0 {
+            commas[nc & 15] = base + mc.trailing_zeros() as usize;
+            nc += 1;
+            mc &= mc - 1;
         }
+        nq += mq.count_ones();
         base += 64;
     }
     if ls < n {
-        finish(ls, n, nc, &commas, quoted);
+        finish(ls, n, nc, &commas, nq);
     }
 }

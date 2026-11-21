@@ -3,7 +3,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 
 pub struct Huge;
-const BIG: usize = 4 << 20;
+const BIG: usize = 1 << 20;
 const ALIGN: usize = 2 << 20;
 unsafe extern "C" {
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
